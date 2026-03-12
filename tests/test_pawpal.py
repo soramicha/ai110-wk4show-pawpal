@@ -285,3 +285,157 @@ def test_tasks_by_time_returns_chronological_order():
     plan = Scheduler(owner).build_plan()
     times = [st.start_time for st in plan.tasks_by_time()]
     assert times == sorted(times)
+
+
+def test_tasks_by_time_on_empty_plan_returns_empty_list():
+    """tasks_by_time() on a plan with no scheduled tasks should return []."""
+    owner = Owner(name="Jordan", available_minutes=0)
+    pet = Pet(name="Mochi", species="dog")
+    pet.add_task(Task("Walk", 30, Priority.HIGH))
+    owner.add_pet(pet)
+
+    plan = Scheduler(owner).build_plan()
+    assert plan.tasks_by_time() == []
+
+
+def test_sorting_with_all_same_priority():
+    """Scheduler should produce a valid plan when all tasks share the same priority."""
+    owner = Owner(name="Jordan", available_minutes=90, day_start="08:00")
+    pet = Pet(name="Mochi", species="dog")
+    for title in ["C task", "A task", "B task"]:
+        pet.add_task(Task(title, 10, Priority.MEDIUM))
+    owner.add_pet(pet)
+
+    plan = Scheduler(owner).build_plan()
+    assert len(plan.scheduled_tasks) == 3
+    times = [st.start_time for st in plan.tasks_by_time()]
+    assert times == sorted(times)
+
+
+# ---------------------------------------------------------------------------
+# Recurrence edge cases
+# ---------------------------------------------------------------------------
+
+def test_mark_complete_does_not_set_next_due_for_one_off():
+    """mark_complete on a task with frequency=None should leave next_due as None."""
+    task = Task("Vet visit", 60, Priority.HIGH)   # no frequency
+    assert task.next_due is None
+    task.mark_complete()
+    assert task.next_due is None
+
+
+def test_mark_complete_twice_updates_next_due():
+    """Calling mark_complete a second time should recalculate next_due from the new date."""
+    from datetime import date, timedelta
+    day1 = date(2026, 3, 12)
+    day2 = date(2026, 3, 13)
+    task = Task("Walk", 30, Priority.HIGH, frequency="daily")
+
+    task.mark_complete(today=day1)
+    assert task.next_due == date(2026, 3, 13)
+
+    task.reset()
+    task.mark_complete(today=day2)
+    assert task.next_due == date(2026, 3, 14)
+
+
+# ---------------------------------------------------------------------------
+# Conflict detection edge cases
+# ---------------------------------------------------------------------------
+
+def test_check_conflicts_empty_when_no_fixed_tasks():
+    """check_conflicts() should return [] when no tasks have a fixed_time."""
+    owner = Owner(name="Jordan")
+    pet = Pet(name="Mochi", species="dog")
+    pet.add_task(Task("Walk", 30, Priority.HIGH))      # flexible
+    pet.add_task(Task("Feed", 10, Priority.MEDIUM))    # flexible
+    owner.add_pet(pet)
+    assert Scheduler(owner).check_conflicts() == []
+
+
+def test_check_conflicts_empty_when_fixed_tasks_do_not_overlap():
+    """check_conflicts() should return [] when fixed-time tasks don't overlap."""
+    owner = Owner(name="Jordan", available_minutes=60)
+    pet = Pet(name="Mochi", species="dog")
+    pet.add_task(Task("Breakfast", 10, Priority.HIGH, fixed_time="08:00"))
+    pet.add_task(Task("Meds",       5, Priority.HIGH, fixed_time="09:00"))
+    owner.add_pet(pet)
+    assert Scheduler(owner).check_conflicts() == []
+
+
+def test_check_conflicts_detects_partial_overlap():
+    """check_conflicts() catches tasks that overlap in duration, not just same start time."""
+    owner = Owner(name="Jordan", available_minutes=60)
+    pet = Pet(name="Mochi", species="dog")
+    # Task A: 08:00–08:20, Task B: 08:10–08:30 — they overlap by 10 min
+    pet.add_task(Task("Task A", 20, Priority.HIGH, fixed_time="08:00"))
+    pet.add_task(Task("Task B", 20, Priority.HIGH, fixed_time="08:10"))
+    owner.add_pet(pet)
+
+    conflicts = Scheduler(owner).check_conflicts()
+    assert len(conflicts) == 1
+    titles = {conflicts[0][0].title, conflicts[0][1].title}
+    assert titles == {"Task A", "Task B"}
+
+
+def test_check_conflicts_three_way_clash_returns_three_pairs():
+    """Three fixed-time tasks all at the same time should return 3 conflict pairs."""
+    owner = Owner(name="Jordan", available_minutes=60)
+    pet = Pet(name="Mochi", species="dog")
+    pet.add_task(Task("A", 10, Priority.HIGH, fixed_time="08:00"))
+    pet.add_task(Task("B", 10, Priority.HIGH, fixed_time="08:00"))
+    pet.add_task(Task("C", 10, Priority.HIGH, fixed_time="08:00"))
+    owner.add_pet(pet)
+
+    conflicts = Scheduler(owner).check_conflicts()
+    assert len(conflicts) == 3
+
+
+# ---------------------------------------------------------------------------
+# Edge cases — empty owner / all-complete / exact budget
+# ---------------------------------------------------------------------------
+
+def test_build_plan_with_no_pets_returns_empty_plan():
+    """Scheduler should return an empty DailyPlan when the owner has no pets."""
+    owner = Owner(name="Jordan", available_minutes=120)
+    plan = Scheduler(owner).build_plan()
+    assert plan.scheduled_tasks == []
+    assert plan.unscheduled_tasks == []
+    assert plan.conflict_warnings == []
+
+
+def test_build_plan_with_all_tasks_completed_returns_empty_plan():
+    """Scheduler should produce an empty plan when all tasks are already marked done."""
+    owner = Owner(name="Jordan", available_minutes=120)
+    pet = Pet(name="Mochi", species="dog")
+    t = Task("Walk", 30, Priority.HIGH)
+    t.mark_complete()
+    pet.add_task(t)
+    owner.add_pet(pet)
+
+    plan = Scheduler(owner).build_plan()
+    assert plan.scheduled_tasks == []
+
+
+def test_task_exactly_filling_budget_is_scheduled():
+    """A single task whose duration equals available_minutes should be scheduled."""
+    owner = Owner(name="Jordan", available_minutes=30)
+    pet = Pet(name="Mochi", species="dog")
+    pet.add_task(Task("Walk", 30, Priority.HIGH))
+    owner.add_pet(pet)
+
+    plan = Scheduler(owner).build_plan()
+    assert len(plan.scheduled_tasks) == 1
+    assert plan.unscheduled_tasks == []
+
+
+def test_task_exceeding_budget_by_one_minute_is_dropped():
+    """A task that needs one more minute than the budget should go to unscheduled_tasks."""
+    owner = Owner(name="Jordan", available_minutes=29)
+    pet = Pet(name="Mochi", species="dog")
+    pet.add_task(Task("Walk", 30, Priority.HIGH))
+    owner.add_pet(pet)
+
+    plan = Scheduler(owner).build_plan()
+    assert plan.scheduled_tasks == []
+    assert len(plan.unscheduled_tasks) == 1
