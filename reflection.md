@@ -42,13 +42,21 @@ After an AI review of the initial skeleton, three changes were made:
 
 **a. Constraints and priorities**
 
-- What constraints does your scheduler consider (for example: time, priority, preferences)?
-- How did you decide which constraints mattered most?
+The scheduler considers three constraints, in this order:
+
+1. **Fixed time** — tasks with a `fixed_time` (e.g. medication at 09:00) are placed first and cannot be moved. This is the hardest constraint; nothing else can displace a fixed-time task.
+2. **Priority** — among flexible tasks, `HIGH` comes before `MEDIUM`, which comes before `LOW`. Priority was chosen as the second constraint because it directly reflects the owner's stated importance, not just convenience.
+3. **Time budget** — tasks are added greedily until `available_minutes` is exhausted. Any task that doesn't fit is recorded in `unscheduled_tasks` with no further attempt to reorder.
+
+Fixed time was ranked first because a pet medication has a clinical reason for its exact time — rescheduling it would be wrong, not just inconvenient.
 
 **b. Tradeoffs**
 
-- Describe one tradeoff your scheduler makes.
-- Why is that tradeoff reasonable for this scenario?
+**Tradeoff: greedy scheduling does not backtrack.**
+
+The scheduler picks tasks in priority order and commits each one immediately. If a 30-minute HIGH task is placed at 08:10, and a 25-minute gap appears later that could fit two MEDIUM tasks but not the HIGH one, the MEDIUM tasks are still scheduled after the HIGH one — even if swapping them would fit more total tasks in the day.
+
+*Why this is reasonable:* For a daily pet care routine, correctness of priority matters more than maximising the number of tasks completed. A greedy approach is also simple to understand and test: the owner can predict exactly which tasks will be included based on priority order. A backtracking or bin-packing solver would be harder to explain ("why did the scheduler skip my HIGH walk?") and harder to debug when it makes a surprising choice.
 
 ---
 

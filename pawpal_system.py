@@ -11,7 +11,9 @@ Architecture:
 """
 
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from enum import Enum
+from itertools import combinations
 from typing import Optional
 
 
@@ -41,19 +43,42 @@ class Task:
         fixed_time        — HH:MM string if the task must start at a specific time;
                             None means the Scheduler can place it anywhere
         completed         — True once the owner marks it done for the day
+        frequency         — None (one-off), "daily", or "weekly".
+                            When mark_complete() is called, next_due is set
+                            automatically using timedelta.
+        next_due          — the date this task should next appear in the schedule.
+                            Set automatically by mark_complete(); None until first completion.
     """
     title: str
     duration_minutes: int
     priority: Priority
     fixed_time: Optional[str] = None
     completed: bool = False
+    frequency: Optional[str] = None   # None | "daily" | "weekly"
+    next_due: Optional[date] = None   # auto-set by mark_complete()
 
-    def mark_complete(self) -> None:
-        """Mark this task as done for today."""
+    _FREQ_DELTA: dict = field(default_factory=lambda: {
+        "daily":  timedelta(days=1),
+        "weekly": timedelta(weeks=1),
+    }, init=False, repr=False, compare=False)
+
+    def mark_complete(self, today: Optional[date] = None) -> None:
+        """
+        Mark this task done and, for recurring tasks, schedule the next occurrence.
+
+        Uses timedelta to calculate next_due:
+          daily  → today + 1 day
+          weekly → today + 7 days
+        """
         self.completed = True
+        if self.frequency is not None:
+            ref = today or date.today()
+            delta = self._FREQ_DELTA.get(self.frequency)
+            if delta:
+                self.next_due = ref + delta
 
     def reset(self) -> None:
-        """Clear completion status (e.g. at the start of a new day)."""
+        """Clear completion status so the task appears pending again."""
         self.completed = False
 
 
@@ -95,6 +120,30 @@ class Pet:
     def pending_tasks(self) -> list[Task]:
         """Return only tasks that have not been marked complete."""
         return [t for t in self.tasks if not t.completed]
+
+    def filter_tasks(
+        self,
+        priority: Optional[Priority] = None,
+        completed: Optional[bool] = None,
+    ) -> list[Task]:
+        """
+        Return tasks matching the given filters.                        (improvement 2)
+
+        Args:
+            priority   — if set, only return tasks with this priority level
+            completed  — if True/False, filter by completion status;
+                         if None, return tasks regardless of status
+        """
+        result = self.tasks
+        if priority is not None:
+            result = [t for t in result if t.priority == priority]
+        if completed is not None:
+            result = [t for t in result if t.completed == completed]
+        return result
+
+    def get_task(self, title: str) -> Optional[Task]:
+        """Return the first task whose title matches, or None."""
+        return next((t for t in self.tasks if t.title == title), None)
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +190,51 @@ class Owner:
         """Return only incomplete (pet, task) pairs — useful for daily scheduling."""
         return [(pet, task) for pet in self.pets for task in pet.pending_tasks()]
 
+    def reset_day(self, today: Optional[date] = None) -> int:
+        """
+        Reset recurring tasks whose next_due date has arrived.
+
+        Call this at the start of each day.  Uses task.next_due (set by
+        mark_complete + timedelta) to decide whether a task should become
+        pending again.  Tasks without a frequency are never reset here.
+
+        Args:
+            today — the date to compare against; defaults to date.today()
+
+        Returns the number of tasks reset.
+        """
+        ref = today or date.today()
+        count = 0
+        for pet in self.pets:
+            for task in pet.tasks:
+                if (
+                    task.frequency is not None
+                    and task.completed
+                    and task.next_due is not None
+                    and task.next_due <= ref
+                ):
+                    task.reset()
+                    count += 1
+        return count
+
 
 # ---------------------------------------------------------------------------
 # Scheduler output types
 # ---------------------------------------------------------------------------
+
+@dataclass
+class ConflictWarning:
+    """
+    Records why a fixed-time task was dropped from the plan.  (improvement 3)
+
+    blocked_task   — the task that could not be placed
+    blocking_task  — the already-scheduled task that occupies the same window
+    pet            — the pet the blocked task belongs to
+    """
+    blocked_task: Task
+    blocking_task: Task
+    pet: Pet
+
 
 @dataclass
 class ScheduledTask:
@@ -163,11 +253,19 @@ class DailyPlan:
 
     scheduled_tasks   — tasks that fit, ordered by start time
     unscheduled_tasks — (pet, task) pairs dropped because they exceeded the budget
-                        or conflicted with a fixed-time task
+    conflict_warnings — structured records explaining fixed-time conflicts (improvement 3)
     """
     owner: Owner
     scheduled_tasks: list[ScheduledTask] = field(default_factory=list)
     unscheduled_tasks: list[tuple[Pet, Task]] = field(default_factory=list)
+    conflict_warnings: list[ConflictWarning] = field(default_factory=list)  # improvement 3
+
+    def tasks_by_time(self) -> list[ScheduledTask]:
+        """Return scheduled tasks sorted chronologically by start time."""        # improvement 4
+        return sorted(
+            self.scheduled_tasks,
+            key=lambda st: (int(st.start_time[:2]), int(st.start_time[3:]))
+        )
 
     def summary(self) -> str:
         """Return a human-readable summary of the plan for terminal or UI display."""
@@ -176,13 +274,21 @@ class DailyPlan:
         if not self.scheduled_tasks:
             lines.append("  No tasks scheduled.")
         else:
-            for st in self.scheduled_tasks:
+            for st in self.tasks_by_time():
                 tag = f"[{st.task.priority.value.upper()}]"
                 lines.append(
                     f"  {st.start_time} – {st.end_time}  {tag:<8}  "
                     f"{st.task.title}  ({st.pet.name})"
                 )
                 lines.append(f"    ↳ {st.reason}")
+
+        if self.conflict_warnings:
+            lines.append("\n  Fixed-time conflicts (task dropped):")
+            for cw in self.conflict_warnings:
+                lines.append(
+                    f"    ✗ '{cw.blocked_task.title}' ({cw.pet.name}) blocked by "
+                    f"'{cw.blocking_task.title}' at {cw.blocking_task.fixed_time}"
+                )
 
         if self.unscheduled_tasks:
             lines.append("\n  Could not fit into today's schedule:")
@@ -208,7 +314,7 @@ class Scheduler:
     Strategy:
       1. Ask Owner.get_pending_tasks() for all (pet, task) pairs.
       2. Separate fixed-time tasks from flexible tasks.
-      3. Check fixed-time tasks for conflicts; drop conflicting ones.
+      3. Check fixed-time tasks for conflicts; record ConflictWarnings for drops.
       4. Sort flexible tasks by priority (HIGH → MEDIUM → LOW).
       5. Greedily place flexible tasks into gaps until the budget runs out.
       6. Return a DailyPlan ordered chronologically.
@@ -235,16 +341,20 @@ class Scheduler:
 
         plan = DailyPlan(owner=self.owner)
         budget = self.owner.available_minutes
-        occupied: list[tuple[int, int]] = []  # (start_min, end_min) of committed slots
+        occupied: list[tuple[int, int, Task]] = []  # (start, end, task) for conflict lookup
 
         # --- fixed-time tasks first ---
         for pet, task in fixed:
             start = self._time_to_minutes(task.fixed_time)
             end = start + task.duration_minutes
-            if self._conflicts(start, end, occupied):
-                plan.unscheduled_tasks.append((pet, task))
+            blocker = self._find_blocker(start, end, occupied)
+            if blocker is not None:
+                # improvement 3 — named ConflictWarning instead of silent drop
+                plan.conflict_warnings.append(
+                    ConflictWarning(blocked_task=task, blocking_task=blocker, pet=pet)
+                )
                 continue
-            occupied.append((start, end))
+            occupied.append((start, end, task))
             plan.scheduled_tasks.append(ScheduledTask(
                 task=task,
                 pet=pet,
@@ -263,8 +373,8 @@ class Scheduler:
                 continue
             start = self._find_next_free_slot(cursor, task.duration_minutes, occupied)
             end = start + task.duration_minutes
-            occupied.append((start, end))
-            occupied.sort()
+            occupied.append((start, end, task))
+            occupied.sort(key=lambda x: x[0])
             plan.scheduled_tasks.append(ScheduledTask(
                 task=task,
                 pet=pet,
@@ -275,15 +385,16 @@ class Scheduler:
             budget -= task.duration_minutes
             cursor = end
 
-        # Sort final list chronologically
-        plan.scheduled_tasks.sort(
-            key=lambda st: self._time_to_minutes(st.start_time)
-        )
         return plan
 
     def check_conflicts(self) -> list[tuple[Task, Task]]:
         """
         Return pairs of fixed-time tasks (across all pets) whose windows overlap.
+
+        Uses itertools.combinations to generate every unique (a, b) pair without
+        repeats — cleaner than a manual nested range loop and expresses the intent
+        directly: "check every combination of two fixed tasks".
+
         Call this before build_plan() to surface problems early.
         """
         fixed = [
@@ -293,14 +404,11 @@ class Scheduler:
             for _, t in self.owner.get_pending_tasks()
             if t.fixed_time is not None
         ]
-        conflicts = []
-        for i in range(len(fixed)):
-            for j in range(i + 1, len(fixed)):
-                s1, e1, t1 = fixed[i]
-                s2, e2, t2 = fixed[j]
-                if not (e1 <= s2 or s1 >= e2):
-                    conflicts.append((t1, t2))
-        return conflicts
+        return [
+            (t1, t2)
+            for (s1, e1, t1), (s2, e2, t2) in combinations(fixed, 2)
+            if not (e1 <= s2 or s1 >= e2)
+        ]
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -313,13 +421,22 @@ class Scheduler:
         return sorted(pairs, key=lambda pt: self.PRIORITY_ORDER[pt[1].priority])
 
     def _conflicts(
-        self, start: int, end: int, occupied: list[tuple[int, int]]
+        self, start: int, end: int, occupied: list[tuple[int, int, Task]]
     ) -> bool:
         """Return True if [start, end) overlaps any interval in occupied."""
-        return any(not (end <= s or start >= e) for s, e in occupied)
+        return any(not (end <= s or start >= e) for s, e, _ in occupied)
+
+    def _find_blocker(
+        self, start: int, end: int, occupied: list[tuple[int, int, Task]]
+    ) -> Optional[Task]:
+        """Return the first Task in occupied that overlaps [start, end), or None."""
+        for s, e, task in occupied:
+            if not (end <= s or start >= e):
+                return task
+        return None
 
     def _find_next_free_slot(
-        self, from_min: int, duration: int, occupied: list[tuple[int, int]]
+        self, from_min: int, duration: int, occupied: list[tuple[int, int, Task]]
     ) -> int:
         """Return the earliest start (>= from_min) where duration minutes are free."""
         start = from_min
@@ -328,7 +445,7 @@ class Scheduler:
             if not self._conflicts(start, end, occupied):
                 return start
             # Jump past whichever occupied block is in the way
-            blocking_ends = [e for s, e in occupied if not (end <= s or start >= e)]
+            blocking_ends = [e for s, e, _ in occupied if not (end <= s or start >= e)]
             start = max(blocking_ends)
 
     def _compute_end_time(self, start_time: str, duration_minutes: int) -> str:
