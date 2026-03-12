@@ -14,13 +14,27 @@ The three core actions a user should be able to perform in PawPal+:
 
 **b. Initial design**
 
-- Briefly describe your initial UML design.
-- What classes did you include, and what responsibilities did you assign to each?
+The initial design has five classes and one enum:
 
-**b. Design changes**
+| Class / Enum | Responsibility |
+|---|---|
+| `Priority` (Enum) | Defines the valid priority levels (`HIGH`, `MEDIUM`, `LOW`) as a type-safe constant rather than a raw string |
+| `Pet` | Holds the pet's identity — name, species, and a list of special needs (e.g. `"diabetes"`, `"senior"`). Read by the Scheduler to personalize reasoning. |
+| `Task` | Represents one care activity. Stores title, duration in minutes, a `Priority` value, and an optional fixed start time for time-locked tasks like medication. |
+| `Owner` | Stores the owner's name, total available minutes for the day, and the time the scheduling window opens (`day_start`). The Scheduler reads these to set the time budget and anchor point. |
+| `ScheduledTask` | A `Task` that has been committed to the plan. Adds `start_time`, `end_time`, and a plain-language `reason` so the UI can explain the plan. |
+| `DailyPlan` | The Scheduler's output. Holds a list of `ScheduledTask` objects (what fits) and a list of unscheduled `Task` objects (what was dropped). Exposes a `summary()` method for the UI. |
+| `Scheduler` | The only class with real logic. Takes an `Owner`, `Pet`, and task list; produces a `DailyPlan`. Internally separates fixed-time vs flexible tasks, checks for conflicts, sorts by priority, and greedily fills the time budget. |
 
-- Did your design change during implementation?
-- If yes, describe at least one change and why you made it.
+**c. Design changes**
+
+After an AI review of the initial skeleton, three changes were made:
+
+1. **Added `Priority` enum** — The original design used raw strings (`"low"`, `"medium"`, `"high"`). The AI flagged that a typo like `"hight"` would fail silently. Replacing strings with a `Priority` enum makes invalid values a caught error rather than a quiet bug. `PRIORITY_ORDER` on `Scheduler` was updated to key on `Priority` members instead of strings.
+
+2. **Added `end_time` to `ScheduledTask`** — The original `ScheduledTask` only had `start_time`. The AI noted that without an end time, the scheduler has no way to detect whether two fixed-time tasks overlap. Adding `end_time` (computed from start + duration) enables a dedicated `_check_fixed_time_conflicts()` helper.
+
+3. **Added `day_start` to `Owner` and `_compute_end_time()` to `Scheduler`** — The original `Owner` only had `available_minutes` with no anchor. The AI pointed out that placing flexible tasks at absolute times (e.g. "09:40") requires knowing when the day begins. `day_start` (default `"08:00"`) was added to `Owner`, and a `_compute_end_time()` stub was added to `Scheduler` to handle the HH:MM arithmetic.
 
 ---
 
